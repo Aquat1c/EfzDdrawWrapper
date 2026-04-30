@@ -228,7 +228,10 @@ static void LOG(const char *fmt, ...);
    ═══════════════════════════════════════════════════════════════════════════ */
 #define DIERR_INPUTLOST          0x8007001EL
 #define DIERR_NOTACQUIRED        0x8007000CL
+#define DISCL_EXCLUSIVE_DI       0x00000001
+#define DISCL_NONEXCLUSIVE_DI    0x00000002
 #define DISCL_FOREGROUND_DI      0x00000004
+#define DISCL_NOWINKEY_DI        0x00000010
 
 typedef HRESULT (WINAPI *PFN_DirectInputCreateEx)(
     HINSTANCE hinst, DWORD dwVersion, REFIID riidltf, void **ppvOut,
@@ -452,11 +455,20 @@ static HRESULT __stdcall DIDev_SetCooperativeLevel(DInputDeviceProxy *dev,
 {
     typedef HRESULT (__stdcall *Fn)(void *, HWND, DWORD);
     HRESULT hr;
+    DWORD origFlags = flags;
     dev->hWnd = hWnd;
+
+    /* DISCL_EXCLUSIVE for keyboard is deprecated on Vista+ but may still route
+     * input exclusively and block RegisterHotKey / other LL hooks (OBS etc.).
+     * DISCL_NOWINKEY is still honored on Windows 10 and suppresses the Win key.
+     * Force DISCL_NONEXCLUSIVE and strip DISCL_NOWINKEY on all devices so that
+     * system shortcuts (Alt+Tab, Win key, OBS hotkeys) continue to work. */
+    flags = (flags & ~(DISCL_EXCLUSIVE_DI | DISCL_NOWINKEY_DI)) | DISCL_NONEXCLUSIVE_DI;
+
     dev->coopFlags = flags;
     hr = ((Fn)(*(void ***)dev->real)[13])(dev->real, hWnd, flags);
-    LOG("DI SetCooperativeLevel dev=%p real=%p hwnd=%p flags=%08X active=%d hr=%08X",
-        (void *)dev, dev->real, (void *)hWnd, flags, g_appActive, (DWORD)hr);
+    LOG("DI SetCooperativeLevel dev=%p real=%p hwnd=%p origFlags=%08X flags=%08X active=%d hr=%08X",
+        (void *)dev, dev->real, (void *)hWnd, origFlags, flags, g_appActive, (DWORD)hr);
     return hr;
 }
 
@@ -1283,12 +1295,15 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
             g_renderTraceAfterFocus = TRUE;
             g_renderTraceBudget = 20;
             g_wndTraceBudget = 80;
-            LOG("Focus WM_ACTIVATE serial=%u active %d->%d state=%u minimized=%u hwnd=%p other=%p fg=%p swallowed=1",
+            LOG("Focus WM_ACTIVATE serial=%u active %d->%d state=%u minimized=%u hwnd=%p other=%p fg=%p",
                 g_focusSerial, g_appActive, newActive, LOWORD(wParam),
                 HIWORD(wParam), (void *)hWnd, (void *)lParam,
                 (void *)GetForegroundWindow());
         }
         g_appActive = newActive;
+        /* Forward to game so it can Unacquire/Acquire DirectInput on focus change */
+        if (g_dd && g_dd->origWndProc)
+            return CallWindowProcA(g_dd->origWndProc, hWnd, msg, wParam, lParam);
         return DefWindowProcA(hWnd, msg, wParam, lParam);
     } else if (msg == WM_ACTIVATEAPP) {
         BOOL newActive = (wParam != FALSE);
@@ -1298,17 +1313,22 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
             g_renderTraceAfterFocus = TRUE;
             g_renderTraceBudget = 20;
             g_wndTraceBudget = 80;
-            LOG("Focus WM_ACTIVATEAPP serial=%u active %d->%d thread=%lu hwnd=%p fg=%p swallowed=1",
+            LOG("Focus WM_ACTIVATEAPP serial=%u active %d->%d thread=%lu hwnd=%p fg=%p",
                 g_focusSerial, g_appActive, newActive, (DWORD)lParam,
                 (void *)hWnd, (void *)GetForegroundWindow());
         }
         g_appActive = newActive;
+        /* Forward to game so it can Unacquire/Acquire DirectInput on focus change */
+        if (g_dd && g_dd->origWndProc)
+            return CallWindowProcA(g_dd->origWndProc, hWnd, msg, wParam, lParam);
         return DefWindowProcA(hWnd, msg, wParam, lParam);
     } else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
-        LOG("Focus %s active=%d hwnd=%p other=%p fg=%p focusSerial=%u swallowed=1",
+        LOG("Focus %s active=%d hwnd=%p other=%p fg=%p focusSerial=%u",
             msg == WM_SETFOCUS ? "WM_SETFOCUS" : "WM_KILLFOCUS",
             g_appActive, (void *)hWnd, (void *)wParam,
             (void *)GetForegroundWindow(), g_focusSerial);
+        if (g_dd && g_dd->origWndProc)
+            return CallWindowProcA(g_dd->origWndProc, hWnd, msg, wParam, lParam);
         return DefWindowProcA(hWnd, msg, wParam, lParam);
     } else if (msg == WM_PAINT && g_renderTraceAfterFocus) {
         LOG("Render WM_PAINT after-focus active=%d hwnd=%p primary=%p focusSerial=%u",
@@ -1324,6 +1344,20 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
             msg, g_appActive, (void *)hWnd, (DWORD)wParam, (DWORD)lParam,
             g_focusSerial);
         g_wndTraceBudget--;
+    }
+
+    /* Intercept WM_SYSCOMMAND before the game sees it.
+     * Old fullscreen games swallow SC_KEYMENU (Alt key), SC_SCREENSAVE and
+     * SC_MONITORPOWER.  We must let SC_KEYMENU reach DefWindowProc so that
+     * Alt-based system shortcuts (Alt+F4, system menu) keep working, and we
+     * suppress the screen-saver / monitor-off commands ourselves so the game
+     * does not have to handle them. */
+    if (msg == WM_SYSCOMMAND) {
+        WPARAM cmd = wParam & 0xFFF0;
+        if (cmd == SC_SCREENSAVE || cmd == SC_MONITORPOWER)
+            return 0;
+        if (cmd == SC_KEYMENU)
+            return DefWindowProcA(hWnd, msg, wParam, lParam);
     }
 
     /* Prevent the default black-erase before we paint our frame */
