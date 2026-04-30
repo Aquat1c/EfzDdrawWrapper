@@ -1,19 +1,4 @@
-/*
- * ddraw.c  –  DirectDraw 1.0 compatibility wrapper for EFZ
- *
- * Tested versions
- *   EFZ 1.11  |  EFZ BSE 2.13  |  EFZ BME 3.03 Beta  |  EFZ Memorial 4.00
- *
- * Features
- *   • Windowed mode  (default, game resolution client area, centred)
- *   • Borderless fullscreen  (F11 toggle)
- *   • Full software 8-bit palette surface emulation
- *   • GDI StretchDIBits presentation  (no D3D / DXGI dependency)
- *   • Per-frame logging to ddraw_wrapper.log next to the EXE
- *
- * Build: 32-bit only (game executables are PE32 i386)
- *        See CMakeLists.txt or build.bat
- */
+
 
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
@@ -27,9 +12,6 @@
 #define DDRAW_WRAPPER_ENABLE_LOGGING 1
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   HRESULT / error codes
-   ═══════════════════════════════════════════════════════════════════════════ */
 #define DD_OK                      0x00000000L
 #define DDERR_GENERIC              0x80004005L
 #define DDERR_UNSUPPORTED          0x80004001L
@@ -218,15 +200,6 @@ static void LOG(const char *fmt, ...);
 #define LOG(...) ((void)0)
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   DirectInput guard
-
-   EFZ keeps polling foreground DirectInput devices after our DirectDraw shim
-   has made the game windowed. When focus is lost, GetDeviceState can fail
-   without filling the caller's buffer; the game then reads stack/stale bytes
-   as DIK_ESCAPE/DIK_F1...DIK_F12. We wrap the devices and turn lost/inactive
-   foreground input into a clean "nothing pressed" state.
-   ═══════════════════════════════════════════════════════════════════════════ */
 #define DIERR_INPUTLOST          0x8007001EL
 #define DIERR_NOTACQUIRED        0x8007000CL
 #define DISCL_EXCLUSIVE_DI       0x00000001
@@ -475,11 +448,6 @@ static HRESULT __stdcall DIDev_SetCooperativeLevel(DInputDeviceProxy *dev,
     DWORD origFlags = flags;
     dev->hWnd = hWnd;
 
-    /* DISCL_EXCLUSIVE for keyboard is deprecated on Vista+ but may still route
-     * input exclusively and block RegisterHotKey / other LL hooks (OBS etc.).
-     * DISCL_NOWINKEY is still honored on Windows 10 and suppresses the Win key.
-     * Force DISCL_NONEXCLUSIVE and strip DISCL_NOWINKEY on all devices so that
-     * system shortcuts (Alt+Tab, Win key, OBS hotkeys) continue to work. */
     flags = (flags & ~(DISCL_EXCLUSIVE_DI | DISCL_NOWINKEY_DI)) | DISCL_NONEXCLUSIVE_DI;
 
     dev->coopFlags = flags;
@@ -1114,8 +1082,6 @@ static BYTE *alloc_pixels(int w, int h, int *pitchOut)
    GDI frame presentation  (called from IDirectDrawSurface::Flip)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Compute a centred letterbox/pillarbox rect that preserves the game's
-   aspect ratio within (screenW x screenH). */
 static void compute_letterbox(int screenW, int screenH, int gameW, int gameH,
                                int *outX, int *outY, int *outW, int *outH)
 {
@@ -1428,12 +1394,6 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
         g_wndTraceBudget--;
     }
 
-    /* Intercept WM_SYSCOMMAND before the game sees it.
-     * Old fullscreen games swallow SC_KEYMENU (Alt key), SC_SCREENSAVE and
-     * SC_MONITORPOWER.  We must let SC_KEYMENU reach DefWindowProc so that
-     * Alt-based system shortcuts (Alt+F4, system menu) keep working, and we
-     * suppress the screen-saver / monitor-off commands ourselves so the game
-     * does not have to handle them. */
     if (msg == WM_SYSCOMMAND) {
         WPARAM cmd = wParam & 0xFFF0;
         if (cmd == SC_SCREENSAVE || cmd == SC_MONITORPOWER)
@@ -1448,12 +1408,7 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
-        /* Only synthesise a frame from WM_PAINT before the game starts flipping.
-         * Once DDSurf_Flip is active it owns presentation; calling present_frame
-         * here would read the back buffer mid-clear (blank flash) or mid-draw
-         * (torn frame).  Under DWM the last GetDC blit from Flip is preserved in
-         * the window's backing store, so BeginPaint/EndPaint without any drawing
-         * correctly keeps the last completed frame visible. */
+
         if (!g_hasEverFlipped && g_dd && g_dd->primarySurface)
             present_frame(g_dd);
         (void)hdc;
