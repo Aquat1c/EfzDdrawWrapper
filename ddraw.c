@@ -1,7 +1,7 @@
 /*
- * ddraw.c  –  DirectDraw 1.0 compatibility wrapper for EFZ fighting games
+ * ddraw.c  –  DirectDraw 1.0 compatibility wrapper for EFZ
  *
- * Supported titles
+ * Tested versions
  *   EFZ 1.11  |  EFZ BSE 2.13  |  EFZ BME 3.03 Beta  |  EFZ Memorial 4.00
  *
  * Features
@@ -210,6 +210,7 @@ static HINSTANCE        g_hInst     = NULL;
 static HHOOK            g_kbHook    = NULL;
 static BOOL             g_appActive = TRUE;
 static BOOL             g_dinputHooked = FALSE;
+static BOOL             g_hasEverFlipped = FALSE; /* TRUE once the game starts flipping */
 
 #if DDRAW_WRAPPER_ENABLE_LOGGING
 static void LOG(const char *fmt, ...);
@@ -271,6 +272,22 @@ static DWORD g_flipSerial = 0;
 static BOOL  g_renderTraceAfterFocus = FALSE;
 static int   g_renderTraceBudget = 0;
 static int   g_wndTraceBudget = 0;
+
+/* ─── Runtime config (loaded from ddraw_wrapper.ini) ─────────────────────── */
+typedef struct {
+    int  fps_limit;     /* 0 = uncapped; default 60  */
+    BOOL borderless;    /* start borderless fullscreen; default 0 */
+    int  window_scale;  /* integer client-area multiplier (1–8); default 1 */
+    BOOL linear_scale;  /* bilinear stretch (1) vs nearest (0); default 0 */
+} WrapperConfig;
+
+static WrapperConfig g_cfg = { 60, FALSE, 1, FALSE };
+
+/* FPS throttle state */
+static LARGE_INTEGER g_qpcFreq;
+static LARGE_INTEGER g_nextFrameQpc;
+static BOOL          g_qpcInit          = FALSE;
+static BOOL          g_fpsPacedThisFlip = FALSE;
 
 static HRESULT WINAPI Hook_DirectInputCreateEx(
     HINSTANCE hinst, DWORD dwVersion, REFIID riidltf, void **ppvOut,
@@ -991,6 +1008,48 @@ static void hook_dinput_iat(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   FPS throttle  –  shared by DDSurf_Flip and DD_WaitForVerticalBlank
+   ═══════════════════════════════════════════════════════════════════════════ */
+static void fps_throttle(void)
+{
+    if (g_cfg.fps_limit <= 0) return;
+
+    if (!g_qpcInit) {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        QueryPerformanceCounter(&g_nextFrameQpc);
+        g_qpcInit = TRUE;
+    }
+
+    LARGE_INTEGER now;
+    LONGLONG frameTicks = g_qpcFreq.QuadPart / g_cfg.fps_limit;
+
+    QueryPerformanceCounter(&now);
+    LONGLONG waitMs = 0;
+    if (now.QuadPart < g_nextFrameQpc.QuadPart) {
+        /* Sleep most of the remaining interval then spin the last ~1 ms */
+        waitMs = (g_nextFrameQpc.QuadPart - now.QuadPart)
+                 * 1000 / g_qpcFreq.QuadPart;
+        if (waitMs > 1)
+            Sleep((DWORD)(waitMs - 1));
+        do { QueryPerformanceCounter(&now); }
+        while (now.QuadPart < g_nextFrameQpc.QuadPart);
+    }
+
+    /* Advance the deadline by exactly one frame to keep steady cadence */
+    g_nextFrameQpc.QuadPart += frameTicks;
+
+    /* If we're more than one frame behind (e.g. after a pause), reset */
+    QueryPerformanceCounter(&now);
+    if (g_nextFrameQpc.QuadPart < now.QuadPart - frameTicks)
+        g_nextFrameQpc = now;
+
+    static DWORD throttleCallCount = 0;
+    if ((++throttleCallCount % 120) == 1)
+        LOG("fps_throttle call=%u limit=%d waitMs=%lld active=%d",
+            throttleCallCount, g_cfg.fps_limit, (long long)waitMs, g_appActive);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    Logging
    ═══════════════════════════════════════════════════════════════════════════ */
 static void log_init(void)
@@ -1170,14 +1229,36 @@ static void present_frame(MyDDraw *dd)
     if (dd->borderless && src->width > 0 && src->height > 0) {
         compute_letterbox(fullW, fullH, src->width, src->height,
                           &dstX, &dstY, &dstW, &dstH);
-        /* Paint black bars */
-        RECT full = { 0, 0, fullW, fullH };
-        FillRect(hDC, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        /* Fill only the bar regions (not the game image area) to avoid a
+           full-screen black flash visible through DWM compositing. */
+        HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        RECT bar;
+        if (dstY > 0) {                        /* top bar */
+            bar.left = 0; bar.top = 0; bar.right = fullW; bar.bottom = dstY;
+            FillRect(hDC, &bar, black);
+        }
+        if (dstY + dstH < fullH) {             /* bottom bar */
+            bar.left = 0; bar.top = dstY + dstH; bar.right = fullW; bar.bottom = fullH;
+            FillRect(hDC, &bar, black);
+        }
+        if (dstX > 0) {                        /* left bar */
+            bar.left = 0; bar.top = dstY; bar.right = dstX; bar.bottom = dstY + dstH;
+            FillRect(hDC, &bar, black);
+        }
+        if (dstX + dstW < fullW) {             /* right bar */
+            bar.left = dstX + dstW; bar.top = dstY; bar.right = fullW; bar.bottom = dstY + dstH;
+            FillRect(hDC, &bar, black);
+        }
     } else {
         dstX = 0; dstY = 0; dstW = fullW; dstH = fullH;
     }
 
-    SetStretchBltMode(hDC, COLORONCOLOR);
+    if (g_cfg.linear_scale) {
+        SetStretchBltMode(hDC, HALFTONE);
+        SetBrushOrgEx(hDC, 0, 0, NULL);  /* required after HALFTONE */
+    } else {
+        SetStretchBltMode(hDC, COLORONCOLOR);
+    }
     int stretchResult = StretchDIBits(hDC,
                                       dstX, dstY, dstW, dstH,
                                       0, 0, src->width, src->height,
@@ -1210,8 +1291,9 @@ static void set_windowed_mode(MyDDraw *dd)
     SetWindowLongA(hWnd, GWL_STYLE,   style);
     SetWindowLongA(hWnd, GWL_EXSTYLE, exStyle);
 
-    /* Grow the outer rect to fit the game's client area */
-    RECT wr = { 0, 0, dd->gameWidth, dd->gameHeight };
+    /* Grow the outer rect to fit the scaled client area */
+    int scale = (g_cfg.window_scale > 0) ? g_cfg.window_scale : 1;
+    RECT wr = { 0, 0, dd->gameWidth * scale, dd->gameHeight * scale };
     AdjustWindowRectEx(&wr, style, FALSE, exStyle);
     int winW = wr.right  - wr.left;
     int winH = wr.bottom - wr.top;
@@ -1363,10 +1445,18 @@ static LRESULT CALLBACK WrapperWndProc(HWND hWnd, UINT msg,
     /* Prevent the default black-erase before we paint our frame */
     if (msg == WM_ERASEBKGND) return 1;
 
-    if (msg == WM_PAINT && g_dd && g_dd->primarySurface) {
+    if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
-        BeginPaint(hWnd, &ps);
-        present_frame(g_dd);
+        HDC hdc = BeginPaint(hWnd, &ps);
+        /* Only synthesise a frame from WM_PAINT before the game starts flipping.
+         * Once DDSurf_Flip is active it owns presentation; calling present_frame
+         * here would read the back buffer mid-clear (blank flash) or mid-draw
+         * (torn frame).  Under DWM the last GetDC blit from Flip is preserved in
+         * the window's backing store, so BeginPaint/EndPaint without any drawing
+         * correctly keeps the last completed frame visible. */
+        if (!g_hasEverFlipped && g_dd && g_dd->primarySurface)
+            present_frame(g_dd);
+        (void)hdc;
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -1693,8 +1783,15 @@ static HRESULT __stdcall DDSurf_Flip(MyDDSurface *s, MyDDSurface *target, DWORD 
             g_appActive, g_focusSerial);
     }
 
-    if (s && s->isPrimary && s->owner)
+    if (s && s->isPrimary && s->owner) {
+        /* Pace the frame unless WaitForVerticalBlank already did it */
+        if (!g_fpsPacedThisFlip)
+            fps_throttle();
+        g_fpsPacedThisFlip = FALSE;
+
+        g_hasEverFlipped = TRUE;
         present_frame(s->owner);
+    }
     else if (flipNo <= 8 || g_renderTraceAfterFocus) {
         LOG("DDSurf_Flip skipped-present flip=%u reason=%s",
             flipNo, !s ? "null-surface" :
@@ -2031,9 +2128,11 @@ static HRESULT __stdcall DD_SetCooperativeLevel(MyDDraw *dd, HWND hWnd, DWORD dw
         g_kbHook = SetWindowsHookExA(WH_KEYBOARD_LL, LLKeyboardProc, g_hInst, 0);
         LOG("LL keyboard hook installed (%p)", (void *)g_kbHook);
     }
-    /* Window layout is applied once we know the resolution (SetDisplayMode) */
-    if (dd->gameWidth > 0)
-        set_windowed_mode(dd);
+    /* Window layout is handled by SetDisplayMode (which is always called after
+     * SetCooperativeLevel during init).  Do not call set_windowed_mode here —
+     * with WM_ACTIVATEAPP now forwarded to origWndProc the game calls
+     * SetCooperativeLevel on every focus change, and an unnecessary SetWindowPos
+     * triggers WM_PAINT while the back buffer may be mid-clear (flicker). */
 
     return DD_OK;
 }
@@ -2046,8 +2145,11 @@ static HRESULT __stdcall DD_SetDisplayMode(MyDDraw *dd,
     dd->gameHeight = (int)dwHeight;
     LOG("SetDisplayMode %ux%ux%u", dwWidth, dwHeight, dwBPP);
 
-    if (dd->hWnd)
+    if (dd->hWnd) {
         set_windowed_mode(dd);
+        if (g_cfg.borderless)
+            set_borderless_mode(dd);
+    }
 
     return DD_OK;
 }
@@ -2055,7 +2157,10 @@ static HRESULT __stdcall DD_SetDisplayMode(MyDDraw *dd,
 static HRESULT __stdcall DD_WaitForVerticalBlank(MyDDraw *dd,
     DWORD dwFlags, HANDLE hEvent)
 {
-    if (dwFlags == 1) Sleep(1);   /* DDWAITVB_BLOCKBEGIN: yield briefly */
+    if (dwFlags == 1) {  /* DDWAITVB_BLOCKBEGIN */
+        fps_throttle();
+        g_fpsPacedThisFlip = TRUE;  /* tell DDSurf_Flip not to double-wait */
+    }
     return DD_OK;
 }
 
@@ -2153,6 +2258,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
             g_hInst = hInstDLL;
             DisableThreadLibraryCalls(hInstDLL);
             log_init();
+            //config_load();
             LOG("DLL attached (pid=%u)", GetCurrentProcessId());
             break;
         case DLL_PROCESS_DETACH:
