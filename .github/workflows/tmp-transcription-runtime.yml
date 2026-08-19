@@ -1,0 +1,62 @@
+name: Temporary transcription runtime
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - tmp-transcription-trigger.txt
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out workflow revision
+        uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git curl ca-certificates
+
+      - name: Build whisper.cpp CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.7.5 https://github.com/ggerganov/whisper.cpp.git whisper.cpp
+          cmake -S whisper.cpp -B whisper.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF
+          cmake --build whisper.cpp/build --config Release --parallel 2
+          mkdir -p payload
+          cp whisper.cpp/build/bin/whisper-cli payload/whisper-cli
+          chmod +x payload/whisper-cli
+
+      - name: Download multilingual Whisper model
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-all-errors \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true" \
+            -o payload/ggml-small-q5_1.bin
+          test "$(stat -c%s payload/ggml-small-q5_1.bin)" -gt 100000000
+          sha256sum payload/* > payload/SHA256SUMS
+          ldd payload/whisper-cli || true
+          payload/whisper-cli --help >/dev/null
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-small-q5-runtime
+          path: payload
+          retention-days: 1
+          if-no-files-found: error
