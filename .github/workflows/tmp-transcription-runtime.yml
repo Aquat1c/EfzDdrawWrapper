@@ -1,30 +1,30 @@
-name: Temporary transcription runtime
+name: Temporary transcription smoke
 
 on:
-  pull_request:
-    branches:
-      - main
-    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+    paths:
+      - transcription-trigger.txt
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  package:
+  smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Environment smoke test
-        run: |
-          echo "GitHub Actions runner is working"
-          uname -a
-          mkdir -p payload
-          printf 'ok\n' > payload/status.txt
+      - uses: actions/checkout@v4
 
-      - name: Upload smoke artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: transcription-runtime-smoke
-          path: payload/status.txt
-          retention-days: 1
-          if-no-files-found: error
+      - name: Write result
+        run: |
+          mkdir -p transcription-output
+          printf 'success\n' > transcription-output/status.txt
+
+      - name: Commit result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transcription-output/status.txt
+          git commit -m "chore: record transcription smoke result"
+          git push
