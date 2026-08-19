@@ -4,15 +4,14 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - tmp-transcription-trigger.txt
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
 
 jobs:
   package:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Check out workflow revision
