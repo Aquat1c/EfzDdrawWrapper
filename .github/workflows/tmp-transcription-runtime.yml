@@ -1,30 +1,20 @@
 name: Temporary transcription smoke
 
 on:
-  push:
+  pull_request:
     branches: [main]
-    paths:
-      - transcription-trigger.txt
+    types: [opened, reopened, synchronize]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
-      - name: Write result
+      - name: Smoke test
         run: |
-          mkdir -p transcription-output
-          printf 'success\n' > transcription-output/status.txt
-
-      - name: Commit result
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add transcription-output/status.txt
-          git commit -m "chore: record transcription smoke result"
-          git push
+          echo "runner works"
+          uname -a
