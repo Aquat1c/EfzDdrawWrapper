@@ -1,0 +1,33 @@
+name: Clipper native toolchain
+on:
+  push:
+    branches:
+      - build/clipper-native-toolchain-20260908
+    paths:
+      - .github/workflows/clipper-native-toolchain.yml
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Prepare native cross compiler and offline source dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-i686-posix nasm
+          mkdir -p package/deps
+          curl -fL https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz -o package/deps/ffmpeg-7.1.1.tar.xz
+          git clone --depth 1 https://code.videolan.org/videolan/x264.git package/deps/x264
+          rm -rf package/deps/x264/.git
+          sudo tar -czhf package/toolchain.tar.gz /usr/bin/i686-w64-mingw32-* /usr/lib/gcc/i686-w64-mingw32 /usr/i686-w64-mingw32 /usr/share/mingw-w64 /usr/bin/nasm
+          find package -type f -exec sha256sum {} \; > SHA256SUMS
+          mv SHA256SUMS package/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipper-native-toolchain
+          path: package/
+          retention-days: 3
+          if-no-files-found: error
